@@ -60,6 +60,9 @@ type TTSApp struct {
 
 	speakerInit   bool
 	speakerInitMu sync.Mutex
+
+	lastConcatenatedAudio []byte
+	lastAudioMu           sync.Mutex
 }
 
 func main() {
@@ -132,6 +135,29 @@ func (app *TTSApp) worker() {
 		case <-app.ctx.Done():
 			return
 		default:
+			// Check for replay request
+			app.replayMu.Lock()
+			if app.replayRequest {
+				app.replayRequest = false
+				app.replayMu.Unlock()
+
+				app.lastAudioMu.Lock()
+				audioData := app.lastConcatenatedAudio
+				app.lastAudioMu.Unlock()
+
+				if len(audioData) > 0 {
+					// Reset stop flag
+					app.stopCurrentMu.Lock()
+					app.stopCurrent = false
+					app.stopCurrentMu.Unlock()
+					if err := app.playAudio(audioData); err != nil {
+						log.Printf("Error replaying audio: %v", err)
+					}
+				}
+				continue // back to start of loop
+			}
+			app.replayMu.Unlock()
+
 			app.queueMu.Lock()
 			if len(app.queue) == 0 {
 				app.queueMu.Unlock()
@@ -162,19 +188,6 @@ func (app *TTSApp) processText(text string) {
 		}
 		app.stopCurrentMu.Unlock()
 
-		// Check for replay request
-		app.replayMu.Lock()
-		if app.replayRequest {
-			app.replayRequest = false
-			app.replayMu.Unlock()
-			// Re-add current text to front of queue
-			app.queueMu.Lock()
-			app.queue = append([]string{text}, app.queue...)
-			app.queueMu.Unlock()
-			return
-		}
-		app.replayMu.Unlock()
-
 		app.currentTextMu.Lock()
 		app.currentText = chunk
 		app.currentTextMu.Unlock()
@@ -189,6 +202,9 @@ func (app *TTSApp) processText(text string) {
 
 	if len(allAudioData) > 0 {
 		concatenatedAudio := bytes.Join(allAudioData, []byte{})
+		app.lastAudioMu.Lock()
+		app.lastConcatenatedAudio = concatenatedAudio
+		app.lastAudioMu.Unlock()
 		if err := app.playAudio(concatenatedAudio); err != nil {
 			log.Printf("Error playing concatenated audio: %v", err)
 		}
