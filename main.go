@@ -403,6 +403,14 @@ func (app *TTSApp) onReady() {
 	systray.SetTitle("TTS Player")
 	systray.SetTooltip("Text-to-Speech Player")
 
+	//set icon to file tts.ico
+	iconData, err := os.ReadFile("tts.ico")
+	if err != nil {
+		log.Printf("Error loading icon: %v", err)
+	} else {
+		systray.SetIcon(iconData)
+	}
+
 	// Create menu items
 	mVolume := systray.AddMenuItem("Volume", "Adjust playback volume")
 	mVolumeLow := mVolume.AddSubMenuItem("Low", "Set volume to low")
