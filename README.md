@@ -2,6 +2,8 @@
 
 This is a simple Text-to-Speech (TTS) server that runs as a system tray application. It receives text via an HTTP endpoint, queues it, and plays it back as audio using a local TTS engine.
 
+<img width="1024" height="1024" alt="tts" src="https://github.com/user-attachments/assets/d287869c-6a54-46e1-83c4-fc19fbd24635" />
+
 ## Features
 
 - **HTTP Endpoint**: Queue text for playback by sending POST requests to `/queue`.
