@@ -41,6 +41,10 @@ Before running this application, you need:
 
 The application will start, and you will see a new icon in your system tray.
 
+## Release Binary
+
+You can download the pre-built binary for your platform from the [releases page](https://github.com/rpfilomeno/tts-player-server/releases).
+
 ## API Usage
 
 To queue text for playback, send a POST request with a JSON payload to the `/queue` endpoint.
