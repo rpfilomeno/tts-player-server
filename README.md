@@ -19,7 +19,7 @@ This is a simple Text-to-Speech (TTS) server that runs as a system tray applicat
 Before running this application, you need:
 
 1.  **Go**: Ensure you have Go installed on your system.
-2.  **Kokoro TTS API**: This application is designed to work with a local TTS engine accessible at `http://localhost:8880/v1/audio/speech`. You must have this service running.
+2.  **Kokoro TTS API**: This application is designed to work with a [Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI) accessible at `http://localhost:8880/v1/audio/speech`. You must have this service running.
 
 ## Installation and Running
 
