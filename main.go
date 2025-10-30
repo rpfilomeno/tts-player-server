@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	serverAddr   = "0.0.0.0:50058"
+	serverAddr   = "0.0.0.0:50059"
 	kokoroAPI    = "http://localhost:8880/v1/audio/speech"
 	maxChunkSize = 1000
 	sampleRate   = 44100
