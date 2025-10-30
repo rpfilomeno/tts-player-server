@@ -78,6 +78,7 @@ func main() {
 
 	// Run systray (this blocks until Quit is called)
 	systray.Run(app.onReady, app.onExit)
+
 }
 
 // startServer initializes and starts the HTTP server
@@ -121,7 +122,7 @@ func (app *TTSApp) handleQueue(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{"status": "queued"})
-	log.Printf("Text queued: %s", req.Text[:min(50, len(req.Text))])
+	log.Printf("Text queued: %s", req.Text)
 }
 
 // worker continuously processes items from the queue
@@ -146,9 +147,10 @@ func (app *TTSApp) worker() {
 	}
 }
 
-// processText splits text into chunks and plays them
+// processText splits text into chunks, gets audio for each, concatenates, and plays
 func (app *TTSApp) processText(text string) {
 	chunks := splitTextSmartly(text, maxChunkSize)
+	var allAudioData [][]byte
 
 	for _, chunk := range chunks {
 		// Check if we should stop
@@ -177,8 +179,18 @@ func (app *TTSApp) processText(text string) {
 		app.currentText = chunk
 		app.currentTextMu.Unlock()
 
-		if err := app.playChunk(chunk); err != nil {
-			log.Printf("Error playing chunk: %v", err)
+		audioData, err := app.getChunkAudio(chunk)
+		if err != nil {
+			log.Printf("Error getting audio for chunk: %v", err)
+			continue
+		}
+		allAudioData = append(allAudioData, audioData)
+	}
+
+	if len(allAudioData) > 0 {
+		concatenatedAudio := bytes.Join(allAudioData, []byte{})
+		if err := app.playAudio(concatenatedAudio); err != nil {
+			log.Printf("Error playing concatenated audio: %v", err)
 		}
 	}
 
@@ -187,8 +199,10 @@ func (app *TTSApp) processText(text string) {
 	app.currentTextMu.Unlock()
 }
 
-// playChunk sends a text chunk to Kokoro TTS API and plays the audio
-func (app *TTSApp) playChunk(text string) error {
+// getChunkAudio sends a text chunk to Kokoro TTS API and returns the audio data
+func (app *TTSApp) getChunkAudio(text string) ([]byte, error) {
+	log.Printf("Generating audio for text chunk: %s", text[:min(50, len(text))])
+
 	// Create API request
 	reqBody := KokoroRequest{
 		Model: "kokoro",
@@ -198,28 +212,27 @@ func (app *TTSApp) playChunk(text string) error {
 
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
-		return fmt.Errorf("failed to marshal request: %w", err)
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
 	// Make HTTP request
 	resp, err := http.Post(kokoroAPI, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
-		return fmt.Errorf("failed to call TTS API: %w", err)
+		return nil, fmt.Errorf("failed to call TTS API: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("TTS API returned status %d", resp.StatusCode)
+		return nil, fmt.Errorf("TTS API returned status %d", resp.StatusCode)
 	}
 
 	// Read audio data
 	audioData, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("failed to read audio data: %w", err)
+		return nil, fmt.Errorf("failed to read audio data: %w", err)
 	}
 
-	// Play audio
-	return app.playAudio(audioData)
+	return audioData, nil
 }
 
 // playAudio plays MP3 audio data from memory with pause/stop support
@@ -432,7 +445,7 @@ func (app *TTSApp) onReady() {
 			select {
 			case <-mVolumeLow.ClickedCh:
 				app.volumeMu.Lock()
-				app.volume = 0.3
+				app.volume = 0.2
 				app.volumeMu.Unlock()
 				mVolumeLow.Check()
 				mVolumeMed.Uncheck()
