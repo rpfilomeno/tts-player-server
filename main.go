@@ -25,7 +25,6 @@ const (
 	serverAddr   = "0.0.0.0:50059"
 	kokoroAPI    = "http://localhost:8880/v1/audio/speech"
 	maxChunkSize = 1000
-	sampleRate   = 44100
 )
 
 // QueueRequest represents the incoming JSON payload
@@ -214,9 +213,10 @@ func (app *TTSApp) worker() {
 			app.queue = app.queue[1:]
 			app.queueMu.Unlock()
 
-			if item.Type == "text" {
+			switch item.Type {
+			case "text":
 				app.processText(item.Text)
-			} else if item.Type == "audio" {
+			case "audio":
 				// Try to play as is (MP3)
 				if err := app.playAudio(item.AudioData); err != nil {
 					log.Printf("Direct playback failed, trying MP4 extraction: %v", err)
