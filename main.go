@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -39,9 +40,16 @@ type KokoroRequest struct {
 	Input string `json:"input"`
 }
 
+// QueueItem represents an item in the playback queue
+type QueueItem struct {
+	Type      string // "text" or "audio"
+	Text      string
+	AudioData []byte
+}
+
 // TTSApp is the main application structure
 type TTSApp struct {
-	queue         []string
+	queue         []QueueItem
 	queueMu       sync.Mutex
 	server        *http.Server
 	ctx           context.Context
@@ -67,7 +75,7 @@ type TTSApp struct {
 
 func main() {
 	app := &TTSApp{
-		queue:  make([]string, 0),
+		queue:  make([]QueueItem, 0),
 		volume: 0.5, // Default medium volume
 	}
 	app.ctx, app.cancel = context.WithCancel(context.Background())
@@ -88,6 +96,7 @@ func main() {
 func (app *TTSApp) startServer() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/queue", app.handleQueue)
+	mux.HandleFunc("/play", app.handlePlay)
 
 	app.server = &http.Server{
 		Addr:    serverAddr,
@@ -120,12 +129,49 @@ func (app *TTSApp) handleQueue(w http.ResponseWriter, r *http.Request) {
 
 	// Add text to queue
 	app.queueMu.Lock()
-	app.queue = append(app.queue, req.Text)
+	app.queue = append(app.queue, QueueItem{
+		Type: "text",
+		Text: req.Text,
+	})
 	app.queueMu.Unlock()
 
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{"status": "queued"})
 	log.Printf("Text queued: %s", req.Text)
+}
+
+// handlePlay processes POST requests to the /play endpoint
+func (app *TTSApp) handlePlay(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Limit body size to avoid memory issues (e.g., 50MB)
+	r.Body = http.MaxBytesReader(w, r.Body, 50*1024*1024)
+
+	audioData, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read body", http.StatusBadRequest)
+		return
+	}
+
+	if len(audioData) == 0 {
+		http.Error(w, "Empty body", http.StatusBadRequest)
+		return
+	}
+
+	// Add audio to queue
+	app.queueMu.Lock()
+	app.queue = append(app.queue, QueueItem{
+		Type:      "audio",
+		AudioData: audioData,
+	})
+	app.queueMu.Unlock()
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "queued", "type": "audio"})
+	log.Printf("Audio queued, size: %d bytes", len(audioData))
 }
 
 // worker continuously processes items from the queue
@@ -164,11 +210,28 @@ func (app *TTSApp) worker() {
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
-			text := app.queue[0]
+			item := app.queue[0]
 			app.queue = app.queue[1:]
 			app.queueMu.Unlock()
 
-			app.processText(text)
+			if item.Type == "text" {
+				app.processText(item.Text)
+			} else if item.Type == "audio" {
+				// Try to play as is (MP3)
+				if err := app.playAudio(item.AudioData); err != nil {
+					log.Printf("Direct playback failed, trying MP4 extraction: %v", err)
+					// Try to extract from MP4
+					if audioData, err := extractMP4Audio(item.AudioData); err == nil {
+						if err := app.playAudio(audioData); err != nil {
+							log.Printf("Error playing extracted audio: %v", err)
+						} else {
+							log.Println("Successfully played extracted audio from MP4")
+						}
+					} else {
+						log.Printf("Failed to extract audio from MP4: %v", err)
+					}
+				}
+			}
 		}
 	}
 }
@@ -505,7 +568,7 @@ func (app *TTSApp) onReady() {
 				app.stopCurrentMu.Unlock()
 
 				app.queueMu.Lock()
-				app.queue = make([]string, 0)
+				app.queue = make([]QueueItem, 0)
 				app.queueMu.Unlock()
 
 				// Resume if paused to allow stop to take effect
@@ -571,4 +634,67 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// extractMP4Audio attempts to extract audio data from an MP4 container
+// It looks for the 'mdat' atom which contains the media data.
+// Note: This is a very basic extractor and assumes the mdat atom contains
+// the audio stream that can be decoded by the mp3 decoder (e.g. MP3 in MP4).
+// It does NOT decode AAC.
+func extractMP4Audio(data []byte) ([]byte, error) {
+	reader := bytes.NewReader(data)
+	for reader.Len() > 8 {
+		var size uint32
+		var typeBytes [4]byte
+		if err := binary.Read(reader, binary.BigEndian, &size); err != nil {
+			return nil, err
+		}
+		if err := binary.Read(reader, binary.BigEndian, &typeBytes); err != nil {
+			return nil, err
+		}
+		atomType := string(typeBytes[:])
+
+		if atomType == "mdat" {
+			// Found media data
+			payloadSize := int64(size) - 8
+			if payloadSize <= 0 {
+				// If size is 0, it extends to end of file (handled roughly here)
+				// But for mdat it usually has a size.
+				// If size was 1, we should have handled it (not implemented for simplicity as mdat usually has size < 4GB for small clips)
+				// Let's just read the rest if size is weird or 0
+				payload, err := io.ReadAll(reader)
+				return payload, err
+			}
+
+			payload := make([]byte, payloadSize)
+			if _, err := io.ReadFull(reader, payload); err != nil {
+				return nil, err
+			}
+			return payload, nil
+		}
+
+		// Skip atom
+		if size < 8 {
+			// Invalid size or extended size (1) which we don't handle for simplicity in this quick implementation
+			// or 0 (end of file)
+			if size == 1 {
+				// Extended size
+				var largeSize uint64
+				if err := binary.Read(reader, binary.BigEndian, &largeSize); err != nil {
+					return nil, err
+				}
+				// Skip largeSize - 16
+				if _, err := reader.Seek(int64(largeSize)-16, io.SeekCurrent); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			return nil, fmt.Errorf("unsupported atom size: %d", size)
+		}
+
+		if _, err := reader.Seek(int64(size)-8, io.SeekCurrent); err != nil {
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("mdat atom not found")
 }
