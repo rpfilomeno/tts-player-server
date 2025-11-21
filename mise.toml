@@ -1,0 +1,12 @@
+[tools]
+go = "1.25"
+
+[tasks.install]
+description = "Install dependencies"
+alias = "i"
+run = "go mod tidy"
+
+[tasks.build]
+description = "Build the project"
+alias = "b"
+run = "pwsh ./scripts/build.ps1"
