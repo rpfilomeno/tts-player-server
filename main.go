@@ -23,9 +23,20 @@ import (
 
 const (
 	serverAddr   = "0.0.0.0:50059"
-	kokoroAPI    = "http://localhost:8880/v1/audio/speech"
 	maxChunkSize = 1000
+
+	// Defaults
+	defaultKokoroAPI = "http://localhost:8880/v1/audio/speech"
+	defaultModel     = "kokoro"
+	defaultVoice     = "af_sky+af_bella"
 )
+
+// Config represents the application configuration
+type Config struct {
+	KokoroAPI string `json:"kokoroAPI"`
+	Model     string `json:"model"`
+	Voice     string `json:"voice"`
+}
 
 // QueueRequest represents the incoming JSON payload
 type QueueRequest struct {
@@ -70,6 +81,8 @@ type TTSApp struct {
 
 	lastConcatenatedAudio []byte
 	lastAudioMu           sync.Mutex
+
+	config Config
 }
 
 func main() {
@@ -77,6 +90,10 @@ func main() {
 		queue:  make([]QueueItem, 0),
 		volume: 0.5, // Default medium volume
 	}
+
+	// Load configuration
+	app.config = loadConfig()
+
 	app.ctx, app.cancel = context.WithCancel(context.Background())
 	app.pauseCond = sync.NewCond(&app.pauseMu)
 
@@ -284,8 +301,8 @@ func (app *TTSApp) getChunkAudio(text string) ([]byte, error) {
 
 	// Create API request
 	reqBody := KokoroRequest{
-		Model: "kokoro",
-		Voice: "af_sky+af_bella",
+		Model: app.config.Model,
+		Voice: app.config.Voice,
 		Input: text,
 	}
 
@@ -295,7 +312,7 @@ func (app *TTSApp) getChunkAudio(text string) ([]byte, error) {
 	}
 
 	// Make HTTP request
-	resp, err := http.Post(kokoroAPI, "application/json", bytes.NewBuffer(jsonData))
+	resp, err := http.Post(app.config.KokoroAPI, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, fmt.Errorf("failed to call TTS API: %w", err)
 	}
@@ -627,6 +644,45 @@ func (app *TTSApp) onExit() {
 
 	log.Println("Shutdown complete")
 	os.Exit(0)
+}
+
+func loadConfig() Config {
+	config := Config{
+		KokoroAPI: defaultKokoroAPI,
+		Model:     defaultModel,
+		Voice:     defaultVoice,
+	}
+
+	file, err := os.Open("config.json")
+	if err != nil {
+		if os.IsNotExist(err) {
+			log.Println("config.json not found, using default values")
+		} else {
+			log.Printf("Error opening config.json: %v, using default values", err)
+		}
+		return config
+	}
+	defer file.Close()
+
+	var fileConfig Config
+	if err := json.NewDecoder(file).Decode(&fileConfig); err != nil {
+		log.Printf("Error decoding config.json: %v, using default values", err)
+		return config
+	}
+
+	// Override defaults with file values if they are not empty
+	if fileConfig.KokoroAPI != "" {
+		config.KokoroAPI = fileConfig.KokoroAPI
+	}
+	if fileConfig.Model != "" {
+		config.Model = fileConfig.Model
+	}
+	if fileConfig.Voice != "" {
+		config.Voice = fileConfig.Voice
+	}
+
+	log.Printf("Configuration loaded: KokoroAPI=%s, Model=%s, Voice=%s", config.KokoroAPI, config.Model, config.Voice)
+	return config
 }
 
 func min(a, b int) int {

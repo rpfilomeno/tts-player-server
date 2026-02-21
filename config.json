@@ -1,0 +1,5 @@
+{
+  "kokoroAPI": "http://localhost:8880/v1/audio/speech",
+  "model": "kokoro",
+  "voice": "af_sky+af_bella"
+}
