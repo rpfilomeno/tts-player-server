@@ -23,19 +23,20 @@ import (
 
 const (
 	serverAddr   = "0.0.0.0:50059"
-	maxChunkSize = 1000
 
 	// Defaults
 	defaultKokoroAPI = "http://localhost:8880/v1/audio/speech"
 	defaultModel     = "kokoro"
 	defaultVoice     = "af_sky+af_bella"
+	defaultMaxChunkSize = 1000
 )
 
 // Config represents the application configuration
 type Config struct {
-	KokoroAPI string `json:"kokoroAPI"`
-	Model     string `json:"model"`
-	Voice     string `json:"voice"`
+	KokoroAPI    string `json:"kokoroAPI"`
+	Model        string `json:"model"`
+	Voice        string `json:"voice"`
+	MaxChunkSize int    `json:"maxChunkSize"`
 }
 
 // QueueRequest represents the incoming JSON payload
@@ -255,7 +256,7 @@ func (app *TTSApp) worker() {
 
 // processText splits text into chunks, gets audio for each, concatenates, and plays
 func (app *TTSApp) processText(text string) {
-	chunks := splitTextSmartly(text, maxChunkSize)
+	chunks := splitTextSmartly(text, app.config.MaxChunkSize)
 	var allAudioData [][]byte
 
 	for _, chunk := range chunks {
@@ -648,9 +649,10 @@ func (app *TTSApp) onExit() {
 
 func loadConfig() Config {
 	config := Config{
-		KokoroAPI: defaultKokoroAPI,
-		Model:     defaultModel,
-		Voice:     defaultVoice,
+		KokoroAPI:    defaultKokoroAPI,
+		Model:        defaultModel,
+		Voice:        defaultVoice,
+		MaxChunkSize: defaultMaxChunkSize,
 	}
 
 	file, err := os.Open("config.json")
@@ -680,8 +682,11 @@ func loadConfig() Config {
 	if fileConfig.Voice != "" {
 		config.Voice = fileConfig.Voice
 	}
+	if fileConfig.MaxChunkSize != 0 {
+		config.MaxChunkSize = fileConfig.MaxChunkSize
+	}
 
-	log.Printf("Configuration loaded: KokoroAPI=%s, Model=%s, Voice=%s", config.KokoroAPI, config.Model, config.Voice)
+	log.Printf("Configuration loaded: KokoroAPI=%s, Model=%s, Voice=%s, MaxChunkSize=%d", config.KokoroAPI, config.Model, config.Voice, config.MaxChunkSize)
 	return config
 }
 
