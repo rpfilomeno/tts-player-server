@@ -67,18 +67,17 @@ type TTSApp struct {
 	cancel        context.CancelFunc
 	currentText   string
 	currentTextMu sync.RWMutex
-	isPaused      bool
-	pauseMu       sync.Mutex
-	pauseCond     *sync.Cond
 	stopCurrent   bool
 	stopCurrentMu sync.Mutex
 	volume        float64
 	volumeMu      sync.RWMutex
-	replayRequest bool
-	replayMu      sync.Mutex
 
 	speakerInit   bool
 	speakerInitMu sync.Mutex
+
+	ctrl       *beep.Ctrl  // current playback control (nil when idle)
+	playingMu  sync.Mutex  // protects ctrl and playDone
+	playDone   chan struct{} // signals when current playback completes
 
 	lastConcatenatedAudio []byte
 	lastAudioMu           sync.Mutex
@@ -96,7 +95,6 @@ func main() {
 	app.config = loadConfig()
 
 	app.ctx, app.cancel = context.WithCancel(context.Background())
-	app.pauseCond = sync.NewCond(&app.pauseMu)
 
 	// Start the worker goroutine
 	go app.worker()
@@ -198,29 +196,6 @@ func (app *TTSApp) worker() {
 		case <-app.ctx.Done():
 			return
 		default:
-			// Check for replay request
-			app.replayMu.Lock()
-			if app.replayRequest {
-				app.replayRequest = false
-				app.replayMu.Unlock()
-
-				app.lastAudioMu.Lock()
-				audioData := app.lastConcatenatedAudio
-				app.lastAudioMu.Unlock()
-
-				if len(audioData) > 0 {
-					// Reset stop flag
-					app.stopCurrentMu.Lock()
-					app.stopCurrent = false
-					app.stopCurrentMu.Unlock()
-					if err := app.playAudio(audioData); err != nil {
-						log.Printf("Error replaying audio: %v", err)
-					}
-				}
-				continue // back to start of loop
-			}
-			app.replayMu.Unlock()
-
 			app.queueMu.Lock()
 			if len(app.queue) == 0 {
 				app.queueMu.Unlock()
@@ -231,14 +206,16 @@ func (app *TTSApp) worker() {
 			app.queue = app.queue[1:]
 			app.queueMu.Unlock()
 
+			app.stopCurrentMu.Lock()
+			app.stopCurrent = false
+			app.stopCurrentMu.Unlock()
+
 			switch item.Type {
 			case "text":
 				app.processText(item.Text)
 			case "audio":
-				// Try to play as is (MP3)
 				if err := app.playAudio(item.AudioData); err != nil {
 					log.Printf("Direct playback failed, trying MP4 extraction: %v", err)
-					// Try to extract from MP4
 					if audioData, err := extractMP4Audio(item.AudioData); err == nil {
 						if err := app.playAudio(audioData); err != nil {
 							log.Printf("Error playing extracted audio: %v", err)
@@ -332,9 +309,8 @@ func (app *TTSApp) getChunkAudio(text string) ([]byte, error) {
 	return audioData, nil
 }
 
-// playAudio plays MP3 audio data from memory with pause/stop support
+// playAudio plays MP3 audio data from memory. Blocks until playback completes or is stopped.
 func (app *TTSApp) playAudio(audioData []byte) error {
-	// Decode MP3
 	reader := bytes.NewReader(audioData)
 	streamer, format, err := mp3.Decode(io.NopCloser(reader))
 	if err != nil {
@@ -342,7 +318,6 @@ func (app *TTSApp) playAudio(audioData []byte) error {
 	}
 	defer streamer.Close()
 
-	// Initialize speaker if not already done
 	app.speakerInitMu.Lock()
 	if !app.speakerInit {
 		speaker.Init(format.SampleRate, format.SampleRate.N(time.Second/10))
@@ -350,56 +325,28 @@ func (app *TTSApp) playAudio(audioData []byte) error {
 	}
 	app.speakerInitMu.Unlock()
 
-	// Resample if necessary
 	resampled := beep.Resample(4, format.SampleRate, format.SampleRate, streamer)
 
-	// Create control wrapper for pause
-	ctrl := &beep.Ctrl{Streamer: resampled, Paused: false}
+	app.playingMu.Lock()
+	app.ctrl = &beep.Ctrl{Streamer: resampled, Paused: false}
+	app.playDone = make(chan struct{}, 1)
+	app.playingMu.Unlock()
 
-	// Create custom volume control streamer
-	volumeStreamer := &VolumeStreamer{
-		Streamer: ctrl,
-		app:      app,
-	}
+	volumeStreamer := &VolumeStreamer{Streamer: app.ctrl, app: app}
 
-	// Monitor for pause/stop changes
-	done := make(chan bool)
-	go func() {
-		ticker := time.NewTicker(50 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-ticker.C:
-				// Check for stop
-				app.stopCurrentMu.Lock()
-				stopped := app.stopCurrent
-				app.stopCurrentMu.Unlock()
-				if stopped {
-					speaker.Clear()
-					done <- true
-					return
-				}
-
-				// Check for pause
-				app.pauseMu.Lock()
-				paused := app.isPaused
-				app.pauseMu.Unlock()
-
-				speaker.Lock()
-				ctrl.Paused = paused
-				speaker.Unlock()
-			}
-		}
-	}()
-
-	// Play the audio
 	speaker.Play(beep.Seq(volumeStreamer, beep.Callback(func() {
-		done <- true
+		select {
+		case app.playDone <- struct{}{}:
+		default:
+		}
 	})))
 
-	<-done
+	<-app.playDone
+
+	app.playingMu.Lock()
+	app.ctrl = nil
+	app.playDone = nil
+	app.playingMu.Unlock()
 	return nil
 }
 
@@ -527,6 +474,7 @@ func (app *TTSApp) onReady() {
 	mVolumeMed := mVolume.AddSubMenuItem("Medium", "Set volume to medium")
 	mVolumeMed.Check()
 	mVolumeHigh := mVolume.AddSubMenuItem("High", "Set volume to high")
+	mVolumeMuted := mVolume.AddSubMenuItem("Muted", "Mute playback")
 
 	systray.AddSeparator()
 	mPause := systray.AddMenuItem("Pause", "Pause playback")
@@ -547,6 +495,7 @@ func (app *TTSApp) onReady() {
 				mVolumeLow.Check()
 				mVolumeMed.Uncheck()
 				mVolumeHigh.Uncheck()
+				mVolumeMuted.Uncheck()
 				log.Println("Volume set to low")
 
 			case <-mVolumeMed.ClickedCh:
@@ -556,6 +505,7 @@ func (app *TTSApp) onReady() {
 				mVolumeLow.Uncheck()
 				mVolumeMed.Check()
 				mVolumeHigh.Uncheck()
+				mVolumeMuted.Uncheck()
 				log.Println("Volume set to medium")
 
 			case <-mVolumeHigh.ClickedCh:
@@ -565,52 +515,98 @@ func (app *TTSApp) onReady() {
 				mVolumeLow.Uncheck()
 				mVolumeMed.Uncheck()
 				mVolumeHigh.Check()
+				mVolumeMuted.Uncheck()
 				log.Println("Volume set to high")
 
-			case <-mPause.ClickedCh:
-				app.pauseMu.Lock()
-				app.isPaused = !app.isPaused
-				if app.isPaused {
+			case <-mVolumeMuted.ClickedCh:
+				app.volumeMu.Lock()
+				app.volume = 0
+				app.volumeMu.Unlock()
+				mVolumeLow.Uncheck()
+				mVolumeMed.Uncheck()
+				mVolumeHigh.Uncheck()
+				mVolumeMuted.Check()
+				log.Println("Volume muted")
+
+		case <-mPause.ClickedCh:
+			app.playingMu.Lock()
+			c := app.ctrl
+			app.playingMu.Unlock()
+			if c != nil {
+				speaker.Lock()
+				c.Paused = !c.Paused
+				speaker.Unlock()
+				if c.Paused {
 					mPause.SetTitle("Resume")
 					log.Println("Playback paused")
 				} else {
 					mPause.SetTitle("Pause")
-					app.pauseCond.Broadcast()
 					log.Println("Playback resumed")
 				}
-				app.pauseMu.Unlock()
+			}
 
-			case <-mStop.ClickedCh:
-				app.stopCurrentMu.Lock()
-				app.stopCurrent = true
-				app.stopCurrentMu.Unlock()
+		case <-mStop.ClickedCh:
+			app.stopCurrentMu.Lock()
+			app.stopCurrent = true
+			app.stopCurrentMu.Unlock()
 
-				app.queueMu.Lock()
-				app.queue = make([]QueueItem, 0)
-				app.queueMu.Unlock()
+			app.queueMu.Lock()
+			app.queue = make([]QueueItem, 0)
+			app.queueMu.Unlock()
 
-				// Resume if paused to allow stop to take effect
-				app.pauseMu.Lock()
-				if app.isPaused {
-					app.isPaused = false
-					app.pauseCond.Broadcast()
+			// Unpause if paused so Clear takes effect
+			app.playingMu.Lock()
+			if app.ctrl != nil {
+				app.ctrl.Paused = false
+			}
+			done := app.playDone
+			app.playingMu.Unlock()
+
+			speaker.Clear()
+
+			// Signal playAudio to return
+			if done != nil {
+				select {
+				case done <- struct{}{}:
+				default:
 				}
-				app.pauseMu.Unlock()
+			}
+			log.Println("Playback stopped and queue cleared")
 
-				speaker.Clear()
-				log.Println("Playback stopped and queue cleared")
+		case <-mReplay.ClickedCh:
+			app.lastAudioMu.Lock()
+			audioData := app.lastConcatenatedAudio
+			app.lastAudioMu.Unlock()
 
-			case <-mReplay.ClickedCh:
-				app.replayMu.Lock()
-				app.replayRequest = true
-				app.replayMu.Unlock()
-
+			if len(audioData) > 0 {
+				// Stop current playback
 				app.stopCurrentMu.Lock()
 				app.stopCurrent = true
 				app.stopCurrentMu.Unlock()
 
+				app.playingMu.Lock()
+				if app.ctrl != nil {
+					app.ctrl.Paused = false
+				}
+				done := app.playDone
+				app.playingMu.Unlock()
 				speaker.Clear()
-				log.Println("Replay requested")
+				if done != nil {
+					select {
+					case done <- struct{}{}:
+					default:
+					}
+				}
+
+				// Reset stop flag and play replay
+				app.stopCurrentMu.Lock()
+				app.stopCurrent = false
+				app.stopCurrentMu.Unlock()
+				if err := app.playAudio(audioData); err != nil {
+					log.Printf("Error replaying audio: %v", err)
+				}
+			}
+			log.Println("Replay requested")
 
 			case <-mQuit.ClickedCh:
 				log.Println("Quit requested")
@@ -688,13 +684,6 @@ func loadConfig() Config {
 
 	log.Printf("Configuration loaded: KokoroAPI=%s, Model=%s, Voice=%s, MaxChunkSize=%d", config.KokoroAPI, config.Model, config.Voice, config.MaxChunkSize)
 	return config
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 // extractMP4Audio attempts to extract audio data from an MP4 container
